@@ -1,1 +1,258 @@
+name: Turn Scan (Runner Engine)
 
+on:
+  workflow_dispatch:
+    inputs:
+      shards_preset:
+        description: '分片机器预设选择'
+        required: true
+        type: choice
+        options:
+          - '4 台机器 (默认稳妥，推荐 50 万以下)'
+          - '8 台机器 (极速并发，推荐 50 万以上)'
+          - 'custom (使用下方自定义输入)'
+        default: '4 台机器 (默认稳妥，推荐 50 万以下)'
+      custom_shards:
+        description: '自定义分片机器数 (选 custom 时生效，范围 1~20)'
+        required: false
+        default: '4'
+      concur:
+        description: '深度验证并发数 (-c)'
+        required: false
+        default: '100'
+      ping_concur:
+        description: 'TCPing 快速预筛并发数 (-p)'
+        required: false
+        default: '500'
+
+permissions:
+  contents: read
+
+jobs:
+  # 阶段 1: 动态计算矩阵分片 (支持预设与 1~20 范围约束)
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.calc-matrix.outputs.matrix }}
+      total_shards: ${{ steps.calc-matrix.outputs.total_shards }}
+
+    steps:
+      - name: Calculate Shard Matrix
+        id: calc-matrix
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+
+          preset = "${{ github.event.inputs.shards_preset }}"
+          custom = "${{ github.event.inputs.custom_shards }}"
+
+          if "8" in preset:
+              shards = 8
+          elif "custom" in preset:
+              try:
+                  shards = int(custom)
+              except ValueError:
+                  shards = 4
+          else:
+              shards = 4
+
+          # 强制限制最大 20 台，最小 1 台
+          shards = max(1, min(20, shards))
+
+          shard_list = list(range(shards))
+          print(f"[*] 选定分片数量: {shards} 台机器")
+          print(f"[*] 分片矩阵: {shard_list}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"matrix={json.dumps(shard_list)}\n")
+              f.write(f"total_shards={shards}\n")
+          EOF
+
+  # 阶段 2: 动态多机矩阵分片并行扫描 (无上限免费公开算力)
+  scan-matrix:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # 使用 PAT 令牌从私有仓库拉取最新的代码和 ip.txt (完全不泄露私库地址与数据)
+      - name: Checkout Private Repository
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          if [ -z "$MY_PAT" ] || [ -z "$PRIVATE_REPO" ]; then
+            echo "❌ 错误: 必须在公开仓库 Settings -> Secrets 中配置 MY_PAT 与 PRIVATE_REPO！"
+            exit 1
+          fi
+          git clone --depth 1 "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" private_vault
+          cp private_vault/turn_scan.go ./
+          cp private_vault/ip.txt ./
+          rm -rf private_vault
+
+      # 内存实时展开当前机器负责的分片 (2-A 方案: 秒级切片，零过期，零文件体积风险)
+      - name: Expand Target Shard In-Memory
+        run: |
+          python3 - <<'EOF'
+          import ipaddress
+          import os
+          import sys
+
+          shard_index = ${{ matrix.shard }}
+          shard_total = ${{ needs.generate-matrix.outputs.total_shards }}
+          ports = [3478, 3479, 5349]
+          MAX_LIMIT = 5000000
+
+          targets = []
+          seen = set()
+
+          with open("ip.txt", "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+
+                  # 范围支持
+                  if "-" in line:
+                      parts = [p.strip() for p in line.split("-", 1)]
+                      if len(parts) == 2:
+                          try:
+                              s_ip = ipaddress.IPv4Address(parts[0])
+                              e_ip = ipaddress.IPv4Address(parts[1])
+                              if int(s_ip) > int(e_ip):
+                                  s_ip, e_ip = e_ip, s_ip
+                              if (int(e_ip) - int(s_ip) + 1) > MAX_LIMIT:
+                                  continue
+                              curr = int(s_ip)
+                              end = int(e_ip)
+                              while curr <= end:
+                                  ip_str = str(ipaddress.IPv4Address(curr))
+                                  for p in ports:
+                                      t = f"{ip_str}:{p}"
+                                      if t not in seen:
+                                          seen.add(t)
+                                          targets.append(t)
+                                  curr += 1
+                              continue
+                          except ValueError:
+                              continue
+
+                  # CIDR 支持
+                  try:
+                      net = ipaddress.ip_network(line, strict=False)
+                      if net.num_addresses > MAX_LIMIT:
+                          continue
+                      hosts = [net.network_address] if net.num_addresses == 1 else net.hosts()
+                      for ip in hosts:
+                          ip_str = str(ip)
+                          for p in ports:
+                              t = f"{ip_str}:{p}"
+                              if t not in seen:
+                                  seen.add(t)
+                                  targets.append(t)
+                  except ValueError:
+                      pass
+
+          # Round-Robin 均衡切片提取属于当前机器的目标
+          shard_targets = [t for i, t in enumerate(targets) if (i % shard_total) == shard_index]
+          print(f"[*] 全网总目标数: {len(targets)} | 当前分片负责目标数: {len(shard_targets)}")
+
+          with open("shard_targets.txt", "w", encoding="utf-8") as out:
+              out.write("\n".join(shard_targets) + ("\n" if shard_targets else ""))
+          EOF
+
+      # 运行核心扫描引擎
+      - name: Run Turn Shard Scanner
+        run: |
+          go run turn_scan.go \
+            -output "results_${{ matrix.shard }}.txt" \
+            -c ${{ github.event.inputs.concur || '100' }} \
+            -p ${{ github.event.inputs.ping_concur || '500' }} \
+            -input shard_targets.txt
+
+      # 上传分片扫描结果
+      - name: Upload Shard Result Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "shard-${{ matrix.shard }}"
+          path: "results_${{ matrix.shard }}.txt"
+          retention-days: 1
+
+  # 阶段 3: 汇总合并、去重、推回私有仓库 (不公开任何 Release)
+  merge-and-push:
+    needs: [generate-matrix, scan-matrix]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+
+      - name: Merge and deduplicate results
+        id: merge
+        run: |
+          echo "[*] 开始汇总并去重所有分片结果..."
+          mkdir -p temp_merge
+          find shards -type f -name "results_*.txt" -exec cat {} + > temp_merge/raw_results.txt
+
+          TOTAL_LINES=$(grep -v '^\s*$' temp_merge/raw_results.txt 2>/dev/null | wc -l || echo 0)
+          echo "[*] 所有分片收集到的存活行数: $TOTAL_LINES"
+
+          if [ "$TOTAL_LINES" -gt 0 ]; then
+            grep -v '^\s*$' temp_merge/raw_results.txt | sort -u > turn_results.txt
+            ALIVE_COUNT=$(wc -l < turn_results.txt)
+            echo "[+] 汇总去重后存活 TURN: $ALIVE_COUNT"
+            echo "has_alive=true" >> $GITHUB_OUTPUT
+            echo "count=$ALIVE_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "[-] 本次所有分片扫描存活数均为 0，不执行更新！"
+            echo "has_alive=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+      # 将结果安全推回私有仓库 (外界完全看不到结果)
+      - name: Push results back to Private Repository
+        if: steps.merge.outputs.has_alive == 'true'
+        env:
+          MY_PAT: ${{ secrets.MY_PAT }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          git clone "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" target_repo
+          cp turn_results.txt target_repo/
+          cd target_repo
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add turn_results.txt
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update turn_results.txt (${{ steps.date.outputs.date }}) [skip ci]"
+            git pull --rebase origin main || git pull --rebase origin beta
+            git push origin HEAD
+          else
+            echo "[*] 结果无变动，无需提交。"
+          fi
+
+      - name: Clean old workflow runs (Keep latest 1 run)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[*] 清理旧运行记录..."
+          gh run list --workflow="Turn Scan (Runner Engine)" --limit 100 --json databaseId --jq '.[1:][].databaseId' 2>/dev/null | while read -r id; do
+            [ -n "$id" ] && gh run delete "$id" || true
+          done
+          echo "[+] 清理完成！"
