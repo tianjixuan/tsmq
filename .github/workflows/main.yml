@@ -27,9 +27,9 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  # 阶段 1: 动态计算矩阵分片 (支持预设与 1~20 范围约束)
   generate-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -57,7 +57,6 @@ jobs:
           else:
               shards = 4
 
-          # 强制限制最大 20 台，最小 1 台
           shards = max(1, min(20, shards))
 
           shard_list = list(range(shards))
@@ -69,7 +68,6 @@ jobs:
               f.write(f"total_shards={shards}\n")
           EOF
 
-  # 阶段 2: 动态多机矩阵分片并行扫描 (无上限免费公开算力)
   scan-matrix:
     needs: generate-matrix
     runs-on: ubuntu-latest
@@ -84,7 +82,6 @@ jobs:
         with:
           go-version: '1.22'
 
-      # 使用 PAT 令牌从私有仓库拉取最新的代码和 ip.txt (完全不泄露私库地址与数据)
       - name: Checkout Private Repository
         env:
           MY_PAT: ${{ secrets.MY_PAT }}
@@ -99,7 +96,6 @@ jobs:
           cp private_vault/ip.txt ./
           rm -rf private_vault
 
-      # 内存实时展开当前机器负责的分片 (2-A 方案: 秒级切片，零过期，零文件体积风险)
       - name: Expand Target Shard In-Memory
         run: |
           python3 - <<'EOF'
@@ -121,7 +117,6 @@ jobs:
                   if not line or line.startswith("#"):
                       continue
 
-                  # 范围支持
                   if "-" in line:
                       parts = [p.strip() for p in line.split("-", 1)]
                       if len(parts) == 2:
@@ -146,7 +141,6 @@ jobs:
                           except ValueError:
                               continue
 
-                  # CIDR 支持
                   try:
                       net = ipaddress.ip_network(line, strict=False)
                       if net.num_addresses > MAX_LIMIT:
@@ -162,7 +156,6 @@ jobs:
                   except ValueError:
                       pass
 
-          # Round-Robin 均衡切片提取属于当前机器的目标
           shard_targets = [t for i, t in enumerate(targets) if (i % shard_total) == shard_index]
           print(f"[*] 全网总目标数: {len(targets)} | 当前分片负责目标数: {len(shard_targets)}")
 
@@ -170,7 +163,6 @@ jobs:
               out.write("\n".join(shard_targets) + ("\n" if shard_targets else ""))
           EOF
 
-      # 运行核心扫描引擎
       - name: Run Turn Shard Scanner
         run: |
           go run turn_scan.go \
@@ -179,7 +171,6 @@ jobs:
             -p ${{ github.event.inputs.ping_concur || '500' }} \
             -input shard_targets.txt
 
-      # 上传分片扫描结果
       - name: Upload Shard Result Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -187,7 +178,6 @@ jobs:
           path: "results_${{ matrix.shard }}.txt"
           retention-days: 1
 
-  # 阶段 3: 汇总合并、去重、推回私有仓库 (不公开任何 Release)
   merge-and-push:
     needs: [generate-matrix, scan-matrix]
     runs-on: ubuntu-latest
@@ -225,7 +215,6 @@ jobs:
         run: |
           echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
 
-      # 将结果安全推回私有仓库 (外界完全看不到结果)
       - name: Push results back to Private Repository
         if: steps.merge.outputs.has_alive == 'true'
         env:
@@ -246,13 +235,13 @@ jobs:
             echo "[*] 结果无变动，无需提交。"
           fi
 
-      - name: Clean old workflow runs (Keep latest 1 run)
+      - name: Clean old workflow runs
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "[*] 清理旧运行记录..."
-          gh run list --workflow="Turn Scan (Runner Engine)" --limit 100 --json databaseId --jq '.[1:][].databaseId' 2>/dev/null | while read -r id; do
+          echo "[*] 清理全部运行记录..."
+          gh run list --limit 100 --json databaseId --jq '.[].databaseId' 2>/dev/null | while read -r id; do
             [ -n "$id" ] && gh run delete "$id" || true
           done
           echo "[+] 清理完成！"
